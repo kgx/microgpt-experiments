@@ -1,7 +1,6 @@
 """
 Inference: load a saved model and generate text from an optional prompt.
-Run: python main.py --input "your prompt here"
-Use quotes around the prompt if it contains spaces.
+Run: python main.py  or  python main.py --input "prompt"  (use quotes if spaces)
 """
 
 import argparse
@@ -12,42 +11,15 @@ from model import gpt, load_model, softmax
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run micro GPT inference with an optional prompt.",
-        epilog='Use quotes for prompts with spaces: python main.py --input "hello world"',
+        description="Run micro GPT inference.",
+        epilog='Use quotes for prompts with spaces: python main.py -i "hello world"',
     )
-    parser.add_argument(
-        "--input", "-i",
-        default="",
-        help="Prompt string to condition generation (default: empty)",
-    )
-    parser.add_argument(
-        "--model", "-m",
-        default="model.json",
-        help="Path to saved model (default: model.json)",
-    )
-    parser.add_argument(
-        "--samples", "-n",
-        type=int,
-        default=20,
-        help="Number of samples (default: 20, like original)",
-    )
-    parser.add_argument(
-        "--temperature", "-t",
-        type=float,
-        default=0.5,
-        help="Sampling temperature, higher = more random (default: 0.5, like original)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducible output (default: 42, like original)",
-    )
-    parser.add_argument(
-        "--no-seed",
-        action="store_true",
-        help="Do not set random seed (different output each run)",
-    )
+    parser.add_argument("--input", "-i", default="", help="Prompt (default: none, generate from BOS)")
+    parser.add_argument("--model", "-m", default="model.json", help="Path to saved model")
+    parser.add_argument("--samples", "-n", type=int, default=20, help="Number of samples")
+    parser.add_argument("--temperature", "-t", type=float, default=0.5, help="Sampling temperature")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (reproducible)")
+    parser.add_argument("--no-seed", action="store_true", help="No seed (different each run)")
     args = parser.parse_args()
 
     if not args.no_seed:
@@ -63,7 +35,7 @@ def main():
     head_dim = data["head_dim"]
     block_size = data["block_size"]
 
-    # Tokenize prompt: only chars in vocab; unknown chars are skipped
+    # Context = BOS + optional prompt tokens (chars not in vocab are skipped)
     prompt = args.input.strip()
     if prompt:
         prompt_ids = [uchars.index(ch) for ch in prompt if ch in uchars]
@@ -75,9 +47,12 @@ def main():
     for sample_idx in range(args.samples):
         keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
         n_context = min(len(context), block_size)
-        # Fill KV cache: run forward for context positions 0 .. n_context-2
+
+        # Fill KV cache: run gpt at positions 0..n_context-2 (no sampling) so cache is ready
         for pos_id in range(n_context - 1):
             gpt(context[pos_id], pos_id, keys, values, state_dict, n_layer, n_head, head_dim, block_size)
+
+        # Autoregressive decode: start from last context token, sample until BOS or block_size
         token_id = context[n_context - 1]
         pos_id = n_context - 1
         generated = []
