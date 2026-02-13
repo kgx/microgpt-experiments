@@ -107,3 +107,16 @@ Training produces one JSON file: tokenizer (`uchars`), config (n_embd, n_head, n
 - **No PyTorch**: All tensors are scalars (`Value`); matrices are lists of lists. Backprop is explicit over this graph.
 - **Causal attention**: Implemented by the KV cache: at position `pos`, the cache has exactly positions `0..pos`, so attention is only over past and current.
 - **BOS**: Used as start token and as end-of-sequence signal when generating; the model learns when to emit BOS to stop.
+
+---
+
+## BOS and chunked data (e.g. alice)
+
+For **document-style** data (e.g. names: one doc = one name), BOS is a good fit: each sequence is `[BOS, ...token..., BOS]`, so the model learns "after BOS, start content" and "after content, predict BOS" and can stop generation by sampling BOS.
+
+For **chunked long-form text** (alice: one doc = one 128-char chunk from the book), every chunk is still wrapped as `[BOS, ...chars..., BOS]`. Chunk boundaries are arbitrary (sliding window), so BOS is being trained in the **middle** of the narrative: the model sees "…end of chunk BOS start of next chunk…" even though there is no real sequence boundary there. So:
+
+- **Training**: The model learns to predict BOS at chunk boundaries; that signal is somewhat artificial for continuous prose.
+- **Inference**: Generation stops when the model samples BOS. For open-ended prose you may prefer to ignore BOS and stop only at `block_size`, or to treat BOS as a soft "paragraph" boundary rather than hard stop.
+
+So BOS is **appropriate** for document/sequence-style data and **a design quirk** for chunked alice: next-token prediction still learns local coherence, but the meaning of BOS is less clear. A future option could be to train alice without trailing BOS (or with a different framing) and stop generation by length only.

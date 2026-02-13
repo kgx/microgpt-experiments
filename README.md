@@ -99,7 +99,7 @@ The numpy backend is tested for numerical equivalence with the python backend (s
 
 ## Alice scenario
 
-The **alice** scenario uses *Alice's Adventures in Wonderland* (Project Gutenberg). Download the text once:
+The **alice** scenario uses *Alice's Adventures in Wonderland* (Project Gutenberg). Data is chunked into 128-character segments (with overlap). Each chunk is tokenized as `[BOS, ...chars..., BOS]`; see [docs/architecture.md](docs/architecture.md) for how **BOS** (start/end-of-sequence token) works and why it is a better fit for document-style data (e.g. names) than for chunked prose. Download the text once:
 
 ```bash
 python scripts/download_alice.py
