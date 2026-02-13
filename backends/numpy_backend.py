@@ -281,8 +281,11 @@ class NumPyBackend:
         *,
         seed: int | None = 42,
         init_from: dict[str, list[list[float]]] | None = None,
+        dtype: type | str | None = None,
     ):
-        """Build model state. If init_from is provided (e.g. from Python backend), use those weights."""
+        """Build model state. If init_from is provided (e.g. from Python backend), use those weights.
+        dtype: np.float32 for faster CPU training, or np.float64 (default). Can be string 'float32'/'float64'.
+        """
         model_cfg = config["model"]
         train_cfg = config["training"]
         data_cfg = config.get("data", {})
@@ -294,11 +297,16 @@ class NumPyBackend:
         head_dim = n_embd // n_head
         trailing_bos = data_cfg.get("trailing_bos", True)
 
+        if dtype is None:
+            dtype = train_cfg.get("dtype", "float64")
+        if isinstance(dtype, str):
+            dtype = getattr(np, dtype, np.float64)
+
         shapes = _state_dict_shapes(vocab_size, n_embd, n_layer, block_size)
         state_dict = {}
         if init_from:
             for k, shape in shapes.items():
-                arr = np.array(init_from[k], dtype=np.float64)
+                arr = np.array(init_from[k], dtype=dtype)
                 assert arr.shape == shape, f"{k}: {arr.shape} vs {shape}"
                 state_dict[k] = arr.copy()
         else:
@@ -307,7 +315,7 @@ class NumPyBackend:
                 std = 0.02
                 if "attn_wo" in k or "mlp_fc2" in k:
                     std = 0.0
-                state_dict[k] = rng.normal(0, std, size=shape).astype(np.float64)
+                state_dict[k] = rng.normal(0, std, size=shape).astype(dtype)
 
         grad_dict = {k: np.zeros_like(v) for k, v in state_dict.items()}
         m_dict = {k: np.zeros_like(v) for k, v in state_dict.items()}
@@ -335,10 +343,24 @@ class NumPyBackend:
             "eps_adam": train_cfg["eps_adam"],
             "num_steps": train_cfg["num_steps"],
             "trailing_bos": trailing_bos,
+            "dtype": dtype,
         }
 
-    def run_one_step(self, step: int, doc: str, state: dict, uchars: list[str]) -> tuple[float, dict]:
-        """One training step: forward, backward, optimizer. Updates state in place."""
+    def run_one_step(
+        self,
+        step: int,
+        doc: str,
+        state: dict,
+        uchars: list[str],
+        *,
+        zero_grad: bool = True,
+        do_optimizer: bool = True,
+        grad_accum_count: int = 1,
+    ) -> tuple[float, dict]:
+        """One training step: forward, backward, and optionally optimizer. Updates state in place.
+        zero_grad: clear gradient buffers before forward (set False when accumulating).
+        do_optimizer: run Adam after backward. When True and grad_accum_count>1, grads are scaled by 1/grad_accum_count.
+        """
         BOS = len(uchars)
         state_dict = state["state_dict"]
         grad_dict = state["grad_dict"]
@@ -358,8 +380,9 @@ class NumPyBackend:
         char_ids = [uchars.index(ch) for ch in doc if ch in uchars]
         tokens = [BOS] + char_ids + ([BOS] if trailing_bos else [])
         if len(tokens) < 2:
-            for g in grad_dict.values():
-                g.fill(0)
+            if zero_grad:
+                for g in grad_dict.values():
+                    g.fill(0)
             return 0.0, {"forward": 0, "backward": 0, "optimizer": 0}
 
         global _JIT_VERIFY_DONE
@@ -370,9 +393,9 @@ class NumPyBackend:
 
         n = min(block_size, len(tokens) - 1)
 
-        # Zero grads
-        for g in grad_dict.values():
-            g.fill(0)
+        if zero_grad:
+            for g in grad_dict.values():
+                g.fill(0)
 
         t0 = time.perf_counter()
         loss, cache = self._forward(state, tokens, n)
@@ -383,16 +406,21 @@ class NumPyBackend:
         t_backward = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        lr_t = lr * 0.5 * (1 + math.cos(math.pi * step / num_steps))
-        for k in state["ordered_keys"]:
-            m = m_dict[k]
-            v = v_dict[k]
-            g = grad_dict[k]
-            m[:] = beta1 * m + (1 - beta1) * g
-            v[:] = beta2 * v + (1 - beta2) * (g * g)
-            m_hat = m / (1 - beta1 ** (step + 1))
-            v_hat = v / (1 - beta2 ** (step + 1))
-            state_dict[k][:] -= lr_t * m_hat / (np.sqrt(v_hat) + eps)
+        if do_optimizer:
+            if grad_accum_count > 1:
+                scale = 1.0 / grad_accum_count
+                for g in grad_dict.values():
+                    g *= scale
+            lr_t = lr * 0.5 * (1 + math.cos(math.pi * step / num_steps))
+            for k in state["ordered_keys"]:
+                m = m_dict[k]
+                v = v_dict[k]
+                g = grad_dict[k]
+                m[:] = beta1 * m + (1 - beta1) * g
+                v[:] = beta2 * v + (1 - beta2) * (g * g)
+                m_hat = m / (1 - beta1 ** (step + 1))
+                v_hat = v / (1 - beta2 ** (step + 1))
+                state_dict[k][:] -= lr_t * m_hat / (np.sqrt(v_hat) + eps)
         t_optimizer = time.perf_counter() - t0
 
         return float(loss), {"forward": t_forward, "backward": t_backward, "optimizer": t_optimizer}
@@ -444,8 +472,9 @@ class NumPyBackend:
 
                 # Fused kernel: all heads in one call (keys/values as (T, n_embd))
                 T = len(cache["layers"][li]["keys"])
-                keys_arr = np.empty((T, state["n_embd"]), dtype=np.float64)
-                values_arr = np.empty((T, state["n_embd"]), dtype=np.float64)
+                dt = state.get("dtype", np.float64)
+                keys_arr = np.empty((T, state["n_embd"]), dtype=dt)
+                values_arr = np.empty((T, state["n_embd"]), dtype=dt)
                 for t in range(T):
                     keys_arr[t] = cache["layers"][li]["keys"][t]
                     values_arr[t] = cache["layers"][li]["values"][t]
@@ -525,7 +554,7 @@ class NumPyBackend:
                 )
                 grad_dict[f"layer{li}.attn_wo"] += grad_attn_wo_w
 
-                grad_x_in_attn = np.zeros(n_embd, dtype=np.float64)
+                grad_x_in_attn = np.zeros(n_embd, dtype=state.get("dtype", np.float64))
                 for h in range(n_head):
                     hs = h * head_dim
                     g_o = grad_attn_in[hs : hs + head_dim]

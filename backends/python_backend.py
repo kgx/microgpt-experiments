@@ -17,7 +17,7 @@ from model import (
 class PythonBackend:
     """Backend that uses the default Value-based model and autograd."""
 
-    def create_state(self, config: dict, uchars: list[str]):
+    def create_state(self, config: dict, uchars: list[str], **kwargs):
         """Build model state and optimizer state. Returns a state dict for use in run_one_step and weights_for_export."""
         model_cfg = config["model"]
         train_cfg = config["training"]
@@ -52,10 +52,21 @@ class PythonBackend:
             "trailing_bos": trailing_bos,
         }
 
-    def run_one_step(self, step: int, doc: str, state: dict, uchars: list[str]) -> tuple[float, dict]:
+    def run_one_step(
+        self,
+        step: int,
+        doc: str,
+        state: dict,
+        uchars: list[str],
+        *,
+        zero_grad: bool = True,
+        do_optimizer: bool = True,
+        grad_accum_count: int = 1,
+    ) -> tuple[float, dict]:
         """
-        Run one training step (forward, backward, optimizer). Updates state in place.
+        Run one training step (forward, backward, optionally optimizer). Updates state in place.
         Returns (loss_value, timing_dict) with keys "forward", "backward", "optimizer".
+        zero_grad/do_optimizer/grad_accum_count: see numpy_backend.run_one_step.
         """
         BOS = len(uchars)
         state_dict = state["state_dict"]
@@ -74,11 +85,15 @@ class PythonBackend:
         char_ids = [uchars.index(ch) for ch in doc if ch in uchars]
         tokens = [BOS] + char_ids + ([BOS] if trailing_bos else [])
         if len(tokens) < 2:
-            for p in params:
-                p.grad = 0
+            if zero_grad:
+                for p in params:
+                    p.grad = 0
             return 0.0, {"forward": 0, "backward": 0, "optimizer": 0}
 
         n = min(block_size, len(tokens) - 1)
+        if zero_grad:
+            for p in params:
+                p.grad = 0
         keys = [[] for _ in range(n_layer)]
         values = [[] for _ in range(n_layer)]
         losses = []
@@ -98,14 +113,18 @@ class PythonBackend:
         t_backward = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        lr_t = learning_rate * 0.5 * (1 + math.cos(math.pi * step / num_steps))
-        for i, p in enumerate(params):
-            m[i] = beta1 * m[i] + (1 - beta1) * p.grad
-            v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
-            m_hat = m[i] / (1 - beta1 ** (step + 1))
-            v_hat = v[i] / (1 - beta2 ** (step + 1))
-            p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-            p.grad = 0
+        if do_optimizer:
+            scale = 1.0 / grad_accum_count if grad_accum_count > 1 else 1.0
+            lr_t = learning_rate * 0.5 * (1 + math.cos(math.pi * step / num_steps))
+            for i, p in enumerate(params):
+                g = p.grad * scale
+                m[i] = beta1 * m[i] + (1 - beta1) * g
+                v[i] = beta2 * v[i] + (1 - beta2) * (g * g)
+                m_hat = m[i] / (1 - beta1 ** (step + 1))
+                v_hat = v[i] / (1 - beta2 ** (step + 1))
+                p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
+            for p in params:
+                p.grad = 0
         t_optimizer = time.perf_counter() - t0
 
         return loss.data, {"forward": t_forward, "backward": t_backward, "optimizer": t_optimizer}

@@ -82,10 +82,14 @@ def run_training(
     max_steps: int | None = None,
     save: bool = True,
     backend_name: str | None = None,
+    backend_kwargs: dict | None = None,
+    grad_accum_steps: int = 1,
 ) -> None:
     """Run one training run from config and save to output_path.
     If max_steps is set, run at most that many steps. If save is False, do not write the model (for benchmarking).
     backend_name overrides config["training"]["backend"] when set (e.g. from --backend).
+    backend_kwargs: passed to backend.create_state() (e.g. {"dtype": "float32"} for numpy).
+    grad_accum_steps: accumulate gradients over this many docs per optimizer step (reduces steps, can speed up).
     """
     random.seed(42)
     docs = load_docs(config)
@@ -104,7 +108,7 @@ def run_training(
     print(f"vocab size: {vocab_size}")
 
     backend = get_backend(backend_name or train_cfg.get("backend", "python"))
-    state = backend.create_state(config, uchars)
+    state = backend.create_state(config, uchars, **(backend_kwargs or {}))
     params = state["params"]
     num_params = sum(p.size for p in params) if params and hasattr(params[0], "size") else len(params)
     print(f"num params: {num_params}")
@@ -112,10 +116,28 @@ def run_training(
     start_time = time.perf_counter()
     min_steps_for_eta = 2
     steps_limit = num_steps if max_steps is None else min(num_steps, max_steps)
+    backend_impl = backend_name or train_cfg.get("backend", "python")
+    accum = max(1, grad_accum_steps) if backend_impl == "numpy" else 1
 
     for step in range(steps_limit):
-        doc = docs[step % len(docs)]
-        loss, timing = backend.run_one_step(step, doc, state, uchars)
+        step_loss_sum = 0.0
+        step_timing = {"forward": 0.0, "backward": 0.0, "optimizer": 0.0}
+        for sub in range(accum):
+            doc = docs[(step * accum + sub) % len(docs)]
+            loss, timing = backend.run_one_step(
+                step * accum + sub,
+                doc,
+                state,
+                uchars,
+                zero_grad=(sub == 0),
+                do_optimizer=(sub == accum - 1),
+                grad_accum_count=accum,
+            )
+            step_loss_sum += loss
+            step_timing["forward"] += timing["forward"]
+            step_timing["backward"] += timing["backward"]
+            step_timing["optimizer"] += timing["optimizer"]
+        avg_loss = step_loss_sum / accum
 
         if (step + 1) % 100 == 0 or step == 0:
             elapsed = time.perf_counter() - start_time
@@ -123,13 +145,13 @@ def run_training(
             steps_per_sec = steps_done / elapsed if elapsed > 0 else 0
             remaining = steps_limit - steps_done
             eta_str = _format_eta(remaining / steps_per_sec) if (show_eta and steps_done >= min_steps_for_eta and steps_per_sec > 0) else ""
-            line = f"step {steps_done:4d} / {steps_limit:4d} | loss {loss:.4f}"
+            line = f"step {steps_done:4d} / {steps_limit:4d} | loss {avg_loss:.4f}"
             if steps_per_sec > 0:
                 line += f" | {steps_per_sec:.4f} step/s"
             if eta_str:
                 line += f" | ETA {eta_str}"
             if show_timing:
-                t_forward, t_backward, t_optimizer = timing["forward"], timing["backward"], timing["optimizer"]
+                t_forward, t_backward, t_optimizer = step_timing["forward"], step_timing["backward"], step_timing["optimizer"]
                 line += f" | fwd {t_forward:.2f}s bwd {t_backward:.2f}s opt {t_optimizer:.2f}s"
             print(line)
 
@@ -157,6 +179,8 @@ def main():
     parser.add_argument("--no-eta", action="store_true", help="Do not show ETA in progress")
     parser.add_argument("--timing", action="store_true", help="Show per-step breakdown (forward/backward/optimizer)")
     parser.add_argument("--backend", "-b", help="Training backend (default: python, or config training.backend)")
+    parser.add_argument("--dtype", choices=("float32", "float64"), help="NumPy backend only: float32 for faster CPU (default: float64)")
+    parser.add_argument("--grad-accum", type=int, default=1, metavar="N", help="Accumulate gradients over N docs per optimizer step (numpy backend; default 1)")
     args = parser.parse_args()
 
     if args.config:
@@ -176,12 +200,17 @@ def main():
             exit(1)
         output_path = args.output or resolve_model_path(args.scenario)
 
+    backend_kwargs = {}
+    if args.dtype:
+        backend_kwargs["dtype"] = args.dtype
     run_training(
         config,
         output_path,
         show_eta=not args.no_eta,
         show_timing=args.timing,
         backend_name=args.backend,
+        backend_kwargs=backend_kwargs if backend_kwargs else None,
+        grad_accum_steps=max(1, args.grad_accum),
     )
 
 
