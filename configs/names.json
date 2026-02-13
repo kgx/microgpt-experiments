@@ -1,0 +1,22 @@
+{
+  "name": "names",
+  "description": "One document per line (e.g. names); original micro GPT behavior.",
+  "data": {
+    "path": "data/names/input.txt",
+    "format": "lines",
+    "download_url": "https://raw.githubusercontent.com/karpathy/makemore/refs/heads/master/names.txt"
+  },
+  "model": {
+    "n_embd": 16,
+    "n_head": 4,
+    "n_layer": 1,
+    "block_size": 8
+  },
+  "training": {
+    "learning_rate": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps_adam": 1e-8,
+    "num_steps": 500
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "alice",
+  "description": "Alice's Adventures in Wonderland; chunked prose for first step toward language understanding.",
+  "data": {
+    "path": "data/alice/alice.txt",
+    "format": "chunked",
+    "chunk_size": 128,
+    "chunk_overlap": 64
+  },
+  "model": {
+    "n_embd": 32,
+    "n_head": 4,
+    "n_layer": 2,
+    "block_size": 128
+  },
+  "training": {
+    "learning_rate": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps_adam": 1e-8,
+    "num_steps": 2000
+  }
+}
