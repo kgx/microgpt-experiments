@@ -78,7 +78,24 @@ Compare with the default Python backend:
 python scripts/benchmark_train.py --scenario alice --steps 2 --backend python
 ```
 
-The script prints steps/sec and estimated time for a full 2000-step run. The NumPy+Numba backend is typically several times faster than pure Python.
+The script prints steps/sec and estimated time for a full 2000-step run. The NumPy+Numba backend is typically an order of magnitude faster than pure Python (e.g. ~12 min vs ~7 h for alice).
+
+**Verify Numba JIT is active**
+
+```bash
+python scripts/verify_numba_jit.py
+```
+
+You should see `JIT verification: numba JIT active (... compiled)`. To print the same check on the first training step, run with `MICROGPT_VERIFY_JIT=1`.
+
+**Using more cores**
+
+- The fused attention kernel uses Numba’s `parallel=True` and `prange` over heads, so it can use multiple CPU cores. No extra config is needed.
+- NumPy’s matrix ops use BLAS when available; thread count is often controlled by `OPENBLAS_NUM_THREADS` or `OMP_NUM_THREADS` (e.g. `export OMP_NUM_THREADS=4`). Setting this too high can slow things down due to overhead.
+
+**Equivalence**
+
+The numpy backend is tested for numerical equivalence with the python backend (same init, same steps, losses within tolerance). Run: `pytest tests/test_backends.py -v`.
 
 ## Alice scenario
 

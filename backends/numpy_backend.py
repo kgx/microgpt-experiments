@@ -5,16 +5,19 @@ numba for hot loops if available.
 """
 
 import math
+import os
 import time
 
 import numpy as np
 
 try:
     from numba import jit
+    from numba import prange  # noqa: F401 - used in fused kernel
 
     _HAS_NUMBA = True
 except ImportError:
     _HAS_NUMBA = False
+    prange = range  # fallback
 
     def jit(*args, **kwargs):
         def dec(f):
@@ -115,6 +118,84 @@ else:
         return weights @ v
 
 
+def verify_numba_jit() -> tuple[bool, str]:
+    """Verify that Numba JIT is active and compiled. Returns (ok, message)."""
+    if not _HAS_NUMBA:
+        return False, "numba not installed"
+    # Warmup: trigger compilation with small arrays
+    q = np.ones(8, dtype=np.float64)
+    k = np.ones((4, 8), dtype=np.float64)
+    w = np.ones(4, dtype=np.float64)
+    v = np.ones((4, 8), dtype=np.float64)
+    _attention_scores_numba(q, k, 1.0 / math.sqrt(8))
+    _attention_out_numba(w, v)
+    # Check compiled (numba dispatcher has .signatures after first call)
+    has_scores = getattr(_attention_scores_numba, "signatures", None) is not None and len(getattr(_attention_scores_numba, "signatures", [])) > 0
+    has_out = getattr(_attention_out_numba, "signatures", None) is not None and len(getattr(_attention_out_numba, "signatures", [])) > 0
+    if has_scores and has_out:
+        return True, "numba JIT active (attention_scores and attention_out compiled)"
+    return False, "numba present but JIT not compiled (signatures empty)"
+
+
+if _HAS_NUMBA:
+
+    @jit(nopython=True, cache=True, parallel=True)
+    def _attention_all_heads_fused(
+        q: np.ndarray, keys: np.ndarray, values: np.ndarray, head_dim: int, n_head: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """All heads in one kernel: q (n_embd,), keys/values (T, n_embd). Returns (x_attn, weights (n_head,T), logits (n_head,T)). Uses prange over heads for multi-core."""
+        T = keys.shape[0]
+        n_embd = q.shape[0]
+        x_attn = np.zeros(n_embd)
+        weights = np.zeros((n_head, T))
+        logits = np.zeros((n_head, T))
+        scale = 1.0 / math.sqrt(head_dim)
+        for h in prange(n_head):
+            hs = h * head_dim
+            for t in range(T):
+                logits[h, t] = 0.0
+                for j in range(head_dim):
+                    logits[h, t] += q[hs + j] * keys[t, hs + j]
+                logits[h, t] *= scale
+            max_l = logits[h, 0]
+            for t in range(1, T):
+                if logits[h, t] > max_l:
+                    max_l = logits[h, t]
+            for t in range(T):
+                weights[h, t] = math.exp(logits[h, t] - max_l)
+            s = 0.0
+            for t in range(T):
+                s += weights[h, t]
+            for t in range(T):
+                weights[h, t] /= s
+            for j in range(head_dim):
+                for t in range(T):
+                    x_attn[hs + j] += weights[h, t] * values[t, hs + j]
+        return x_attn, weights, logits
+
+else:
+
+    def _attention_all_heads_fused(
+        q: np.ndarray, keys: np.ndarray, values: np.ndarray, head_dim: int, n_head: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Fallback: same math in NumPy (no JIT)."""
+        T = keys.shape[0]
+        n_embd = q.shape[0]
+        x_attn = np.zeros(n_embd)
+        weights = np.zeros((n_head, T))
+        logits = np.zeros((n_head, T))
+        scale = 1.0 / math.sqrt(head_dim)
+        for h in range(n_head):
+            hs = h * head_dim
+            q_h = q[hs : hs + head_dim]
+            k_h = keys[:, hs : hs + head_dim]
+            v_h = values[:, hs : hs + head_dim]
+            logits[h, :] = (k_h @ q_h) * scale
+            weights[h, :] = _softmax_fwd(logits[h, :])
+            x_attn[hs : hs + head_dim] = weights[h, :] @ v_h
+        return x_attn, weights, logits
+
+
 def _attention_fwd(
     q: np.ndarray, k: np.ndarray, v: np.ndarray, head_dim: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -185,6 +266,9 @@ def _state_dict_shapes(vocab_size: int, n_embd: int, n_layer: int, block_size: i
         shapes[f"layer{i}.mlp_fc1"] = (4 * n_embd, n_embd)
         shapes[f"layer{i}.mlp_fc2"] = (n_embd, 4 * n_embd)
     return shapes
+
+
+_JIT_VERIFY_DONE = False
 
 
 class NumPyBackend:
@@ -273,6 +357,12 @@ class NumPyBackend:
                 g.fill(0)
             return 0.0, {"forward": 0, "backward": 0, "optimizer": 0}
 
+        global _JIT_VERIFY_DONE
+        if not _JIT_VERIFY_DONE and os.environ.get("MICROGPT_VERIFY_JIT") == "1":
+            ok, msg = verify_numba_jit()
+            print(f"[numpy backend] JIT check: {msg}")
+            _JIT_VERIFY_DONE = True
+
         n = min(block_size, len(tokens) - 1)
 
         # Zero grads
@@ -347,19 +437,21 @@ class NumPyBackend:
                 cache["layers"][li]["values"].append(v.copy())
                 cache["layers"][li]["rms_scale_attn"].append(rms_scale_attn)
 
-                x_attn = np.zeros(state["n_embd"], dtype=np.float64)
+                # Fused kernel: all heads in one call (keys/values as (T, n_embd))
+                T = len(cache["layers"][li]["keys"])
+                keys_arr = np.empty((T, state["n_embd"]), dtype=np.float64)
+                values_arr = np.empty((T, state["n_embd"]), dtype=np.float64)
+                for t in range(T):
+                    keys_arr[t] = cache["layers"][li]["keys"][t]
+                    values_arr[t] = cache["layers"][li]["values"][t]
+                x_attn, weights_all, logits_all = _attention_all_heads_fused(q, keys_arr, values_arr, head_dim, n_head)
                 for h in range(n_head):
                     hs = h * head_dim
-                    q_h = q[hs : hs + head_dim]
-                    k_h = np.array([cache["layers"][li]["keys"][t][hs : hs + head_dim] for t in range(len(cache["layers"][li]["keys"]))])
-                    v_h = np.array([cache["layers"][li]["values"][t][hs : hs + head_dim] for t in range(len(cache["layers"][li]["values"]))])
-                    out_h, weights, logits = _attention_fwd(q_h, k_h, v_h, head_dim)
-                    cache["layers"][li]["q"].append(q_h.copy())
-                    cache["layers"][li]["k"].append(k_h.copy())
-                    cache["layers"][li]["v"].append(v_h.copy())
-                    cache["layers"][li]["attn_weights"].append(weights.copy())
-                    cache["layers"][li]["attn_logits"].append(logits.copy())
-                    x_attn[hs : hs + head_dim] = out_h
+                    cache["layers"][li]["q"].append(q[hs : hs + head_dim].copy())
+                    cache["layers"][li]["k"].append(keys_arr[:, hs : hs + head_dim].copy())
+                    cache["layers"][li]["v"].append(values_arr[:, hs : hs + head_dim].copy())
+                    cache["layers"][li]["attn_weights"].append(weights_all[h].copy())
+                    cache["layers"][li]["attn_logits"].append(logits_all[h].copy())
 
                 cache["layers"][li]["x_attn"].append(x_attn.copy())
                 x = _linear_fwd(x_attn, state_dict[f"layer{li}.attn_wo"]) + x_res
