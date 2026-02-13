@@ -10,8 +10,9 @@ _REGISTRY: dict[str, type] = {
 }
 
 try:
-    from backends.numpy_backend import NumPyBackend
+    from backends.numpy_backend import NumPyBackend, NumPyBatchedBackend
     _REGISTRY["numpy"] = NumPyBackend
+    _REGISTRY["numpy_batched"] = NumPyBatchedBackend
 except ImportError:
     pass
 

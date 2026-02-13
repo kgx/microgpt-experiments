@@ -88,6 +88,91 @@ def _relu2_bwd(grad_out: np.ndarray, x: np.ndarray) -> np.ndarray:
     return (2.0 * relu_x * (x > 0)) * grad_out
 
 
+# -----------------------------------------------------------------------------
+# Batched (sequence) helpers for optional batched-over-positions path
+# -----------------------------------------------------------------------------
+
+def _rmsnorm_fwd_batched(x: np.ndarray, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray]:
+    """x (T, d) -> (T, d), scale (T,) so each row has RMS 1."""
+    ms = (x * x).mean(axis=1) + eps
+    scale = ms ** -0.5
+    return x * scale[:, np.newaxis], scale
+
+
+def _rmsnorm_bwd_batched(
+    grad_out: np.ndarray, x: np.ndarray, scale: np.ndarray, eps: float = 1e-5
+) -> np.ndarray:
+    """grad_out (T, d), x (T, d), scale (T,) -> grad_x (T, d)."""
+    n = x.shape[1]
+    # per row: grad_x = scale * (grad_out - (scale^2/n) * x * (x . grad_out))
+    x_dot_dout = (x * grad_out).sum(axis=1)
+    grad_x = scale[:, np.newaxis] * (
+        grad_out - (scale * scale / n)[:, np.newaxis] * x * x_dot_dout[:, np.newaxis]
+    )
+    return grad_x
+
+
+def _linear_fwd_batched(x: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """x (T, nin), w (nout, nin) -> out (T, nout)."""
+    return x @ w.T
+
+
+def _linear_bwd_batched(
+    grad_out: np.ndarray, x: np.ndarray, w: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """grad_out (T, nout), x (T, nin), w (nout, nin) -> grad_w (nout, nin), grad_x (T, nin)."""
+    grad_w = grad_out.T @ x
+    grad_x = grad_out @ w
+    return grad_w, grad_x
+
+
+def _causal_attention_batched_fwd(
+    q: np.ndarray, k: np.ndarray, v: np.ndarray, head_dim: int, n_head: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Q,K,V (T, n_embd). Causal attention over positions. Returns (out (T, n_embd), weights (T, T) causal)."""
+    T = q.shape[0]
+    scale = 1.0 / math.sqrt(head_dim)
+    # (T, n_head, head_dim)
+    q_h = q.reshape(T, n_head, head_dim)
+    k_h = k.reshape(T, n_head, head_dim)
+    v_h = v.reshape(T, n_head, head_dim)
+    # scores (T, n_head, T): scores[i,h,j] = q[i,h] . k[j,h]
+    scores = np.einsum("ihd,jhd->ihj", q_h, k_h) * scale
+    causal_mask = np.triu(np.full((T, T), -np.inf), k=1)  # j > i -> -inf
+    scores = scores + causal_mask[:, np.newaxis, :]  # (T, 1, T) broadcasts to (T, n_head, T)
+    weights = np.exp(scores - scores.max(axis=2, keepdims=True))
+    weights = weights / weights.sum(axis=2, keepdims=True)
+    out = np.einsum("ihj,jhd->ihd", weights, v_h)
+    return out.reshape(T, -1), weights
+
+
+def _causal_attention_batched_bwd(
+    grad_out: np.ndarray,
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    weights: np.ndarray,
+    head_dim: int,
+    n_head: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """grad_out (T, n_embd). Backward of causal attention. Returns grad_q, grad_k, grad_v (T, n_embd)."""
+    T = q.shape[0]
+    scale = 1.0 / math.sqrt(head_dim)
+    grad_out_h = grad_out.reshape(T, n_head, head_dim)
+    q_h = q.reshape(T, n_head, head_dim)
+    k_h = k.reshape(T, n_head, head_dim)
+    v_h = v.reshape(T, n_head, head_dim)
+    # grad_weights: dL/d(weights)  -> (T, n_head, T)
+    grad_weights = np.einsum("ihd,jhd->ihj", grad_out_h, v_h)
+    # softmax backward on weights (over last dim, causal)
+    grad_scores = weights * (grad_weights - (weights * grad_weights).sum(axis=2, keepdims=True))
+    # scores[i,h,j] = scale * q[i,h].k[j,h]  (j<=i)
+    grad_q = scale * np.einsum("ihj,jhd->ihd", grad_scores, k_h)
+    grad_k = scale * np.einsum("ihj,ihd->jhd", grad_scores, q_h)
+    grad_v = np.einsum("ihj,ihd->jhd", weights, grad_out_h)
+    return grad_q.reshape(T, -1), grad_k.reshape(T, -1), grad_v.reshape(T, -1)
+
+
 if _HAS_NUMBA:
 
     @jit(nopython=True)
@@ -271,8 +356,8 @@ def _state_dict_shapes(vocab_size: int, n_embd: int, n_layer: int, block_size: i
 _JIT_VERIFY_DONE = False
 
 
-class NumPyBackend:
-    """Backend using NumPy arrays and manual backward. Optional Numba for hot loops."""
+class NumPyBackendBase:
+    """Shared base for NumPy backends: state creation, run_one_step loop, optimizer, export."""
 
     def create_state(
         self,
@@ -511,6 +596,132 @@ class NumPyBackend:
         cache["n"] = n
         return mean_loss, cache
 
+    def _forward_batched(self, state: dict, tokens: list[int], n: int) -> tuple[float, dict]:
+        """Batched forward over n positions in one pass. Returns mean loss and cache for _backward_batched."""
+        state_dict = state["state_dict"]
+        n_layer = state["n_layer"]
+        n_head = state["n_head"]
+        head_dim = state["head_dim"]
+        n_embd = state["n_embd"]
+        dtype = state.get("dtype", np.float64)
+        T = n
+
+        token_ids = np.array([tokens[i] for i in range(T)], dtype=np.intp)
+        target_ids = np.array([tokens[i + 1] for i in range(T)], dtype=np.intp)
+
+        x = state_dict["wte"][token_ids] + state_dict["wpe"][:T]
+        cache = {"x_before_rms_emb": x.copy(), "layers": []}
+        x, rms_scale_emb = _rmsnorm_fwd_batched(x)
+        cache["x_emb"] = x.copy()
+        cache["rms_scale_emb"] = rms_scale_emb.copy()
+
+        for li in range(n_layer):
+            x_res = x.copy()
+            cache_li = {"x_before_rms_attn": x_res.copy()}
+            x, rms_scale_attn = _rmsnorm_fwd_batched(x)
+            cache_li["x_in_attn"] = x.copy()
+            cache_li["rms_scale_attn"] = rms_scale_attn.copy()
+            q = _linear_fwd_batched(x, state_dict[f"layer{li}.attn_wq"])
+            k = _linear_fwd_batched(x, state_dict[f"layer{li}.attn_wk"])
+            v = _linear_fwd_batched(x, state_dict[f"layer{li}.attn_wv"])
+            cache_li["q"], cache_li["k"], cache_li["v"] = q.copy(), k.copy(), v.copy()
+            x_attn, attn_weights = _causal_attention_batched_fwd(q, k, v, head_dim, n_head)
+            cache_li["attn_weights"] = attn_weights.copy()
+            cache_li["x_attn"] = x_attn.copy()
+            x = _linear_fwd_batched(x_attn, state_dict[f"layer{li}.attn_wo"]) + x_res
+            cache_li["x_after_attn"] = x.copy()
+            x_res = x.copy()
+            x, rms_scale_mlp = _rmsnorm_fwd_batched(x)
+            cache_li["rms_scale_mlp"] = rms_scale_mlp.copy()
+            x = _linear_fwd_batched(x, state_dict[f"layer{li}.mlp_fc1"])
+            cache_li["relu2_pre"] = x.copy()
+            x = _relu2_fwd(x)
+            x = _linear_fwd_batched(x, state_dict[f"layer{li}.mlp_fc2"]) + x_res
+            cache["layers"].append(cache_li)
+
+        cache["x_final"] = x.copy()
+        logits = _linear_fwd_batched(x, state_dict["lm_head"])
+        logits_max = logits.max(axis=1, keepdims=True)
+        exps = np.exp(logits - logits_max)
+        probs = exps / exps.sum(axis=1, keepdims=True)
+        cache["logits"] = logits
+        cache["probs"] = probs
+        cache["target_ids"] = target_ids
+        loss_per_pos = -np.log(probs[np.arange(T), target_ids] + 1e-15)
+        mean_loss = float(loss_per_pos.mean())
+        cache["n"] = n
+        return mean_loss, cache
+
+    def _backward_batched(
+        self,
+        state: dict,
+        tokens: list[int],
+        n: int,
+        cache: dict,
+        loss: float,
+        grad_dict: dict,
+    ) -> None:
+        """Backward for batched forward. Accumulates into grad_dict. (loss unused, for signature compatibility.)"""
+        state_dict = state["state_dict"]
+        n_layer = state["n_layer"]
+        n_head = state["n_head"]
+        head_dim = state["head_dim"]
+        n_embd = state["n_embd"]
+        T = n
+        dtype = state.get("dtype", np.float64)
+        scale = 1.0 / T
+        probs = cache["probs"]
+        target_ids = cache["target_ids"]
+        grad_logits = probs.copy()
+        grad_logits[np.arange(T), target_ids] -= 1.0
+        grad_logits *= scale
+
+        grad_x = grad_logits @ state_dict["lm_head"]
+        grad_dict["lm_head"] += grad_logits.T @ cache["x_final"]
+
+        for li in range(n_layer - 1, -1, -1):
+            c = cache["layers"][li]
+            grad_mlp_out = grad_x.copy()
+            grad_fc2_w, grad_fc2_in = _linear_bwd_batched(
+                grad_mlp_out, c["relu2_pre"], state_dict[f"layer{li}.mlp_fc2"]
+            )
+            grad_dict[f"layer{li}.mlp_fc2"] += grad_fc2_w
+            grad_relu2 = _relu2_bwd(grad_fc2_in, c["relu2_pre"])
+            x_after_rms = c["x_after_attn"] * c["rms_scale_mlp"][:, np.newaxis]
+            grad_fc1_w, grad_fc1_in = _linear_bwd_batched(
+                grad_relu2, x_after_rms, state_dict[f"layer{li}.mlp_fc1"]
+            )
+            grad_dict[f"layer{li}.mlp_fc1"] += grad_fc1_w
+            grad_x_after_rms = _rmsnorm_bwd_batched(
+                grad_fc1_in, c["x_after_attn"], c["rms_scale_mlp"]
+            )
+            grad_x_after_attn = grad_x_after_rms + grad_mlp_out
+
+            grad_attn_wo_out = grad_x_after_attn.copy()
+            grad_attn_wo_w, grad_attn_in = _linear_bwd_batched(
+                grad_attn_wo_out, c["x_attn"], state_dict[f"layer{li}.attn_wo"]
+            )
+            grad_dict[f"layer{li}.attn_wo"] += grad_attn_wo_w
+            grad_q, grad_k, grad_v = _causal_attention_batched_bwd(
+                grad_attn_in, c["q"], c["k"], c["v"], c["attn_weights"], head_dim, n_head
+            )
+            grad_x_in_attn = grad_q @ state_dict[f"layer{li}.attn_wq"] + grad_k @ state_dict[f"layer{li}.attn_wk"] + grad_v @ state_dict[f"layer{li}.attn_wv"]
+            grad_dict[f"layer{li}.attn_wq"] += grad_q.T @ c["x_in_attn"]
+            grad_dict[f"layer{li}.attn_wk"] += grad_k.T @ c["x_in_attn"]
+            grad_dict[f"layer{li}.attn_wv"] += grad_v.T @ c["x_in_attn"]
+            grad_x_before_rms_attn = _rmsnorm_bwd_batched(
+                grad_x_in_attn, c["x_before_rms_attn"], c["rms_scale_attn"]
+            )
+            grad_x = grad_x_after_attn + grad_x_before_rms_attn
+
+        grad_emb = _rmsnorm_bwd_batched(
+            grad_x, cache["x_before_rms_emb"], cache["rms_scale_emb"]
+        )
+        token_ids = np.array([tokens[i] for i in range(T)], dtype=np.intp)
+        for i in range(T):
+            grad_dict["wte"][token_ids[i]] += grad_emb[i]
+        grad_dict["wpe"][:T] += grad_emb
+
     def _backward(self, state: dict, tokens: list[int], n: int, cache: dict, loss: float, grad_dict: dict) -> None:
         """Backward: accumulate gradients into grad_dict."""
         state_dict = state["state_dict"]
@@ -587,3 +798,25 @@ class NumPyBackend:
     def weights_for_export(self, state: dict) -> dict:
         """Return state_dict as list-of-lists for JSON."""
         return {k: v.tolist() for k, v in state["state_dict"].items()}
+
+
+class NumPyBackend(NumPyBackendBase):
+    """Sequential position-by-position forward/backward. Uses Numba for attention when available."""
+
+
+class NumPyBatchedBackend(NumPyBackendBase):
+    """Batched-over-positions forward/backward (one sequence pass). Same math, often faster."""
+
+    def _forward(self, state: dict, tokens: list[int], n: int) -> tuple[float, dict]:
+        return self._forward_batched(state, tokens, n)
+
+    def _backward(
+        self,
+        state: dict,
+        tokens: list[int],
+        n: int,
+        cache: dict,
+        loss: float,
+        grad_dict: dict,
+    ) -> None:
+        self._backward_batched(state, tokens, n, cache, loss, grad_dict)

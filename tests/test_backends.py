@@ -87,3 +87,33 @@ def test_numpy_backend_equivalence(config_and_docs):
         assert numpy.isclose(py_l, np_l, rtol=1e-2, atol=1e-4), (
             f"Step {step}: python loss {py_l:.6f} vs numpy loss {np_l:.6f}"
         )
+
+
+def test_numpy_batched_matches_sequential(config_and_docs):
+    """numpy_batched backend matches numpy backend (same init, same steps)."""
+    numpy = pytest.importorskip("numpy")
+    config, docs = config_and_docs
+    uchars = sorted(set("".join(docs)))
+    num_steps = 3
+
+    # Same initial weights for both (from one numpy init, then export)
+    np_backend = get_backend("numpy")
+    state_init = np_backend.create_state(config, uchars)
+    init_from = {k: v.tolist() for k, v in state_init["state_dict"].items()}
+
+    state_seq = np_backend.create_state(config, uchars, init_from=init_from)
+    batch_backend = get_backend("numpy_batched")
+    state_batch = batch_backend.create_state(config, uchars, init_from=init_from)
+    seq_losses = []
+    batch_losses = []
+    for step in range(num_steps):
+        doc = docs[step % len(docs)]
+        loss_s, _ = np_backend.run_one_step(step, doc, state_seq, uchars)
+        loss_b, _ = batch_backend.run_one_step(step, doc, state_batch, uchars)
+        seq_losses.append(loss_s)
+        batch_losses.append(loss_b)
+
+    for step, (seq_l, batch_l) in enumerate(zip(seq_losses, batch_losses)):
+        assert numpy.isclose(seq_l, batch_l, rtol=1e-4, atol=1e-3), (
+            f"Step {step}: sequential {seq_l:.6f} vs batched {batch_l:.6f}"
+        )

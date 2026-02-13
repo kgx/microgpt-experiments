@@ -37,9 +37,10 @@ python train.py --scenario alice
 # Optional: faster training with NumPy backend (pip install microgpt[numpy] or uv sync --extra numpy)
 python train.py --scenario alice --backend numpy
 
-# Further speed on CPU: float32 and gradient accumulation (numpy backend only)
+# Further speed on CPU: float32, gradient accumulation, batched backend
 python train.py --scenario alice_v2 --backend numpy --dtype float32
 python train.py --scenario alice_v2 --backend numpy --dtype float32 --grad-accum 4
+python train.py --scenario alice_v2 --backend numpy_batched   # batched-over-positions (often faster)
 ```
 
 **Inference**
@@ -102,6 +103,7 @@ You should see `JIT verification: numba JIT active (... compiled)`. To print the
 
 - **`--dtype float32`** — Use single precision. Often ~1.5–2× faster on CPU (less memory bandwidth, better SIMD). Config: `training.dtype: "float32"` in your scenario JSON.
 - **`--grad-accum N`** — Accumulate gradients over N docs per optimizer step. Fewer optimizer steps for the same number of docs; can reduce total time when optimizer is a noticeable fraction of step cost. Only supported with the numpy backend.
+- **`--backend numpy_batched`** — Same as `numpy` but with batched-over-positions forward/backward (one sequence-wide pass). Same math, typically faster; tested for numerical equivalence with `numpy`.
 
 **Using more cores**
 

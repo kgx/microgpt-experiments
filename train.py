@@ -117,7 +117,7 @@ def run_training(
     min_steps_for_eta = 2
     steps_limit = num_steps if max_steps is None else min(num_steps, max_steps)
     backend_impl = backend_name or train_cfg.get("backend", "python")
-    accum = max(1, grad_accum_steps) if backend_impl == "numpy" else 1
+    accum = max(1, grad_accum_steps) if backend_impl in ("numpy", "numpy_batched") else 1
 
     for step in range(steps_limit):
         step_loss_sum = 0.0
@@ -180,7 +180,7 @@ def main():
     parser.add_argument("--timing", action="store_true", help="Show per-step breakdown (forward/backward/optimizer)")
     parser.add_argument("--backend", "-b", help="Training backend (default: python, or config training.backend)")
     parser.add_argument("--dtype", choices=("float32", "float64"), help="NumPy backend only: float32 for faster CPU (default: float64)")
-    parser.add_argument("--grad-accum", type=int, default=1, metavar="N", help="Accumulate gradients over N docs per optimizer step (numpy backend; default 1)")
+    parser.add_argument("--grad-accum", type=int, default=1, metavar="N", help="Accumulate gradients over N docs per optimizer step (numpy / numpy_batched; default 1)")
     args = parser.parse_args()
 
     if args.config:
