@@ -7,17 +7,10 @@ import math
 import numpy as np
 
 try:
-    from numba import jit
-    from numba import prange  # noqa: F401
+    import numba  # noqa: F401
     _HAS_NUMBA = True
 except ImportError:
     _HAS_NUMBA = False
-    prange = range
-
-    def jit(*args, **kwargs):
-        def dec(f):
-            return f
-        return dec if not args else dec(*args)
 
 
 # --- Scalar ops ---
@@ -184,34 +177,20 @@ def state_dict_shapes(
     return shapes
 
 
-# --- Attention (sequential / Numba) ---
+# --- Sequential backend: with or without Numba ---
 
 if _HAS_NUMBA:
-
-    @jit(nopython=True)
-    def _attention_scores_numba(q: np.ndarray, k: np.ndarray, scale: float) -> np.ndarray:
-        T = k.shape[0]
-        out = np.empty(T)
-        for t in range(T):
-            out[t] = np.dot(q, k[t]) * scale
-        return out
-
-    @jit(nopython=True)
-    def _attention_out_numba(weights: np.ndarray, v: np.ndarray) -> np.ndarray:
-        T, d = v.shape
-        out = np.zeros(d)
-        for t in range(T):
-            for j in range(d):
-                out[j] += weights[t] * v[t, j]
-        return out
-
+    from .sequential_with_numba import (
+        _attention_scores_numba,
+        _attention_out_numba,
+        attention_all_heads_fused,
+    )
 else:
-
-    def _attention_scores_numba(q: np.ndarray, k: np.ndarray, scale: float) -> np.ndarray:
-        return (k @ q) * scale
-
-    def _attention_out_numba(weights: np.ndarray, v: np.ndarray) -> np.ndarray:
-        return weights @ v
+    from .sequential_without_numba import (
+        _attention_scores_numba,
+        _attention_out_numba,
+        attention_all_heads_fused,
+    )
 
 
 def verify_numba_jit() -> tuple[bool, str]:
@@ -229,63 +208,6 @@ def verify_numba_jit() -> tuple[bool, str]:
     if has_scores and has_out:
         return True, "numba JIT active (attention_scores and attention_out compiled)"
     return False, "numba present but JIT not compiled (signatures empty)"
-
-
-if _HAS_NUMBA:
-
-    @jit(nopython=True, cache=True, parallel=True)
-    def attention_all_heads_fused(
-        q: np.ndarray, keys: np.ndarray, values: np.ndarray, head_dim: int, n_head: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        T = keys.shape[0]
-        n_embd = q.shape[0]
-        x_attn = np.zeros(n_embd)
-        weights = np.zeros((n_head, T))
-        logits = np.zeros((n_head, T))
-        scale = 1.0 / math.sqrt(head_dim)
-        for h in prange(n_head):
-            hs = h * head_dim
-            for t in range(T):
-                logits[h, t] = 0.0
-                for j in range(head_dim):
-                    logits[h, t] += q[hs + j] * keys[t, hs + j]
-                logits[h, t] *= scale
-            max_l = logits[h, 0]
-            for t in range(1, T):
-                if logits[h, t] > max_l:
-                    max_l = logits[h, t]
-            for t in range(T):
-                weights[h, t] = math.exp(logits[h, t] - max_l)
-            s = 0.0
-            for t in range(T):
-                s += weights[h, t]
-            for t in range(T):
-                weights[h, t] /= s
-            for j in range(head_dim):
-                for t in range(T):
-                    x_attn[hs + j] += weights[h, t] * values[t, hs + j]
-        return x_attn, weights, logits
-
-else:
-
-    def attention_all_heads_fused(
-        q: np.ndarray, keys: np.ndarray, values: np.ndarray, head_dim: int, n_head: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        T = keys.shape[0]
-        n_embd = q.shape[0]
-        x_attn = np.zeros(n_embd)
-        weights = np.zeros((n_head, T))
-        logits = np.zeros((n_head, T))
-        scale = 1.0 / math.sqrt(head_dim)
-        for h in range(n_head):
-            hs = h * head_dim
-            q_h = q[hs : hs + head_dim]
-            k_h = keys[:, hs : hs + head_dim]
-            v_h = values[:, hs : hs + head_dim]
-            logits[h, :] = (k_h @ q_h) * scale
-            weights[h, :] = softmax_fwd(logits[h, :])
-            x_attn[hs : hs + head_dim] = weights[h, :] @ v_h
-        return x_attn, weights, logits
 
 
 def attention_fwd(
