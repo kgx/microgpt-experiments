@@ -21,11 +21,14 @@ class PythonBackend:
         """Build model state and optimizer state. Returns a state dict for use in run_one_step and weights_for_export."""
         model_cfg = config["model"]
         train_cfg = config["training"]
+        data_cfg = config.get("data", {})
         n_embd = model_cfg["n_embd"]
         n_head = model_cfg["n_head"]
         n_layer = model_cfg["n_layer"]
         block_size = model_cfg["block_size"]
         vocab_size = len(uchars) + 1
+        # For chunked format, trailing_bos=false trains continuation across chunks (no BOS at chunk end).
+        trailing_bos = data_cfg.get("trailing_bos", True)
 
         state_dict, params = init_state_dict(vocab_size, n_embd, n_layer, block_size)
         m = [0.0] * len(params)
@@ -46,6 +49,7 @@ class PythonBackend:
             "beta2": train_cfg["beta2"],
             "eps_adam": train_cfg["eps_adam"],
             "num_steps": train_cfg["num_steps"],
+            "trailing_bos": trailing_bos,
         }
 
     def run_one_step(self, step: int, doc: str, state: dict, uchars: list[str]) -> tuple[float, dict]:
@@ -65,8 +69,10 @@ class PythonBackend:
         beta1, beta2 = state["beta1"], state["beta2"]
         eps_adam = state["eps_adam"]
         num_steps = state["num_steps"]
+        trailing_bos = state.get("trailing_bos", True)
 
-        tokens = [BOS] + [uchars.index(ch) for ch in doc if ch in uchars] + [BOS]
+        char_ids = [uchars.index(ch) for ch in doc if ch in uchars]
+        tokens = [BOS] + char_ids + ([BOS] if trailing_bos else [])
         if len(tokens) < 2:
             for p in params:
                 p.grad = 0

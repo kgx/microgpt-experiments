@@ -285,12 +285,14 @@ class NumPyBackend:
         """Build model state. If init_from is provided (e.g. from Python backend), use those weights."""
         model_cfg = config["model"]
         train_cfg = config["training"]
+        data_cfg = config.get("data", {})
         n_embd = model_cfg["n_embd"]
         n_head = model_cfg["n_head"]
         n_layer = model_cfg["n_layer"]
         block_size = model_cfg["block_size"]
         vocab_size = len(uchars) + 1
         head_dim = n_embd // n_head
+        trailing_bos = data_cfg.get("trailing_bos", True)
 
         shapes = _state_dict_shapes(vocab_size, n_embd, n_layer, block_size)
         state_dict = {}
@@ -332,6 +334,7 @@ class NumPyBackend:
             "beta2": train_cfg["beta2"],
             "eps_adam": train_cfg["eps_adam"],
             "num_steps": train_cfg["num_steps"],
+            "trailing_bos": trailing_bos,
         }
 
     def run_one_step(self, step: int, doc: str, state: dict, uchars: list[str]) -> tuple[float, dict]:
@@ -350,8 +353,10 @@ class NumPyBackend:
         beta1, beta2 = state["beta1"], state["beta2"]
         eps = state["eps_adam"]
         num_steps = state["num_steps"]
+        trailing_bos = state.get("trailing_bos", True)
 
-        tokens = [BOS] + [uchars.index(ch) for ch in doc if ch in uchars] + [BOS]
+        char_ids = [uchars.index(ch) for ch in doc if ch in uchars]
+        tokens = [BOS] + char_ids + ([BOS] if trailing_bos else [])
         if len(tokens) < 2:
             for g in grad_dict.values():
                 g.fill(0)

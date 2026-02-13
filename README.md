@@ -48,7 +48,13 @@ python main.py --scenario alice -i "Alice"
 
 # By explicit model path
 python main.py --model models/names/model.json -i "A"
+
+# Longer / continuous generation (e.g. for prose models trained with trailing_bos: false)
+python main.py --scenario alice_v2 -i "Alice" --no-stop-at-bos --max-tokens 100
+python main.py --scenario alice_v2 -i "Alice" --chain --max-chars 500 -n 1
 ```
+
+Inference options: `--no-stop-at-bos` (do not stop on BOS; use with length-based stopping), `--max-tokens N` (cap new tokens per sample), `--chain` (repeatedly extend by using the last `block_size-1` chars as the next prompt until `--max-chars` is reached).
 
 If the model file does not exist, inference exits immediately with an error (fail-fast).
 
@@ -106,3 +112,5 @@ python scripts/download_alice.py
 ```
 
 Then train with a larger context and a slightly bigger model (see `configs/alice.json`).
+
+**alice_v2** (`configs/alice_v2.json`) uses the same data but with `trailing_bos: false` so the model learns continuation across chunks, and 5000 steps for better coherence. Train with `python train.py --scenario alice_v2` (or `--backend numpy` for speed). At inference use `--no-stop-at-bos` and optionally `--chain --max-chars N` for longer output.
