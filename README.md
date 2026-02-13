@@ -59,7 +59,7 @@ python main.py --scenario alice_v2 -i "Alice" --no-stop-at-bos --max-tokens 100
 python main.py --scenario alice_v2 -i "Alice" --chain --max-chars 500 -n 1
 ```
 
-Inference options: `--no-stop-at-bos` (do not stop on BOS; use with length-based stopping), `--max-tokens N` (cap new tokens per sample), `--chain` (repeatedly extend by using the last `block_size-1` chars as the next prompt until `--max-chars` is reached).
+Inference options: `--no-stop-at-bos` (do not stop on BOS; use with length-based stopping), `--max-tokens N` (cap new tokens per sample), `--chain` (repeatedly extend by using the last N chars as prompt until `--max-chars`; N defaults to `block_size//2` so each segment can generate many tokens). For more coherent prose, use `--repetition-penalty` (e.g. 1.2), `--repetition-window` (e.g. 32), and `--top-k` (e.g. 40); set `--repetition-penalty 1.0` and `--top-k 0` to disable.
 
 If the model file does not exist, inference exits immediately with an error (fail-fast).
 
