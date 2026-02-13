@@ -11,14 +11,11 @@ import argparse
 import math
 import os
 import random
+import time
 
 from config import load_config, resolve_data_path, resolve_model_path
-from model import (
-    gpt,
-    init_state_dict,
-    save_model,
-    softmax,
-)
+from model import save_model
+from backends import get_backend
 
 
 def load_docs(config: dict) -> list[str]:
@@ -62,8 +59,34 @@ def load_docs(config: dict) -> list[str]:
     raise ValueError(f"Unknown data format: {fmt}")
 
 
-def run_training(config: dict, output_path: str) -> None:
-    """Run one training run from config and save to output_path."""
+def _format_eta(seconds: float) -> str:
+    """Format seconds as human-readable ETA (e.g. 26h 23m or 1m 30s)."""
+    if seconds <= 0 or not math.isfinite(seconds):
+        return "?"
+    s = int(round(seconds))
+    if s >= 3600:
+        h, rest = divmod(s, 3600)
+        m = rest // 60
+        return f"{h}h {m}m"
+    if s >= 60:
+        m, sec = divmod(s, 60)
+        return f"{m}m {sec}s"
+    return f"{s}s"
+
+
+def run_training(
+    config: dict,
+    output_path: str,
+    show_eta: bool = True,
+    show_timing: bool = False,
+    max_steps: int | None = None,
+    save: bool = True,
+    backend_name: str | None = None,
+) -> None:
+    """Run one training run from config and save to output_path.
+    If max_steps is set, run at most that many steps. If save is False, do not write the model (for benchmarking).
+    backend_name overrides config["training"]["backend"] when set (e.g. from --backend).
+    """
     random.seed(42)
     docs = load_docs(config)
     print(f"num docs: {len(docs)}")
@@ -74,57 +97,52 @@ def run_training(config: dict, output_path: str) -> None:
     n_head = model_cfg["n_head"]
     n_layer = model_cfg["n_layer"]
     block_size = model_cfg["block_size"]
-    learning_rate = train_cfg["learning_rate"]
-    beta1 = train_cfg["beta1"]
-    beta2 = train_cfg["beta2"]
-    eps_adam = train_cfg["eps_adam"]
     num_steps = train_cfg["num_steps"]
 
     uchars = sorted(set("".join(docs)))
-    BOS = len(uchars)
     vocab_size = len(uchars) + 1
-    head_dim = n_embd // n_head
     print(f"vocab size: {vocab_size}")
 
-    state_dict, params = init_state_dict(vocab_size, n_embd, n_layer, block_size)
-    print(f"num params: {len(params)}")
+    backend = get_backend(backend_name or train_cfg.get("backend", "python"))
+    state = backend.create_state(config, uchars)
+    params = state["params"]
+    num_params = sum(p.size for p in params) if params and hasattr(params[0], "size") else len(params)
+    print(f"num params: {num_params}")
 
-    m = [0.0] * len(params)
-    v = [0.0] * len(params)
+    start_time = time.perf_counter()
+    min_steps_for_eta = 2
+    steps_limit = num_steps if max_steps is None else min(num_steps, max_steps)
 
-    for step in range(num_steps):
+    for step in range(steps_limit):
         doc = docs[step % len(docs)]
-        tokens = [BOS] + [uchars.index(ch) for ch in doc if ch in uchars] + [BOS]
-        if len(tokens) < 2:
-            continue
-        n = min(block_size, len(tokens) - 1)
-
-        keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-        losses = []
-        for pos_id in range(n):
-            token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-            logits = gpt(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_dim, block_size)
-            probs = softmax(logits)
-            loss_t = -probs[target_id].log()
-            losses.append(loss_t)
-        loss = (1 / n) * sum(losses)
-
-        loss.backward()
-
-        lr_t = learning_rate * 0.5 * (1 + math.cos(math.pi * step / num_steps))
-        for i, p in enumerate(params):
-            m[i] = beta1 * m[i] + (1 - beta1) * p.grad
-            v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
-            m_hat = m[i] / (1 - beta1 ** (step + 1))
-            v_hat = v[i] / (1 - beta2 ** (step + 1))
-            p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-            p.grad = 0
+        loss, timing = backend.run_one_step(step, doc, state, uchars)
 
         if (step + 1) % 100 == 0 or step == 0:
-            print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}")
+            elapsed = time.perf_counter() - start_time
+            steps_done = step + 1
+            steps_per_sec = steps_done / elapsed if elapsed > 0 else 0
+            remaining = steps_limit - steps_done
+            eta_str = _format_eta(remaining / steps_per_sec) if (show_eta and steps_done >= min_steps_for_eta and steps_per_sec > 0) else ""
+            line = f"step {steps_done:4d} / {steps_limit:4d} | loss {loss:.4f}"
+            if steps_per_sec > 0:
+                line += f" | {steps_per_sec:.4f} step/s"
+            if eta_str:
+                line += f" | ETA {eta_str}"
+            if show_timing:
+                t_forward, t_backward, t_optimizer = timing["forward"], timing["backward"], timing["optimizer"]
+                line += f" | fwd {t_forward:.2f}s bwd {t_backward:.2f}s opt {t_optimizer:.2f}s"
+            print(line)
+
+    elapsed_total = time.perf_counter() - start_time
+    if not save:
+        steps_per_sec = steps_limit / elapsed_total if elapsed_total > 0 else 0
+        full_eta = _format_eta((num_steps - steps_limit) / steps_per_sec) if steps_per_sec > 0 and num_steps > steps_limit else "N/A"
+        print(f"Benchmark: {steps_limit} steps in {elapsed_total:.2f}s ({steps_per_sec:.4f} step/s). Full run ({num_steps} steps) would take ~{full_eta}")
+        return
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    save_model(output_path, state_dict, uchars, n_embd, n_head, n_layer, block_size)
+    state_dict_export = backend.weights_for_export(state)
+    save_model(output_path, state_dict_export, uchars, n_embd, n_head, n_layer, block_size)
     print(f"Saved model to {output_path}")
 
 
@@ -136,6 +154,9 @@ def main():
     parser.add_argument("--scenario", "-s", default="names", help="Scenario name (configs/<scenario>.json)")
     parser.add_argument("--config", "-c", help="Path to config JSON (overrides --scenario)")
     parser.add_argument("--output", "-o", help="Output model path (default: models/<scenario>/model.json)")
+    parser.add_argument("--no-eta", action="store_true", help="Do not show ETA in progress")
+    parser.add_argument("--timing", action="store_true", help="Show per-step breakdown (forward/backward/optimizer)")
+    parser.add_argument("--backend", "-b", help="Training backend (default: python, or config training.backend)")
     args = parser.parse_args()
 
     if args.config:
@@ -155,7 +176,13 @@ def main():
             exit(1)
         output_path = args.output or resolve_model_path(args.scenario)
 
-    run_training(config, output_path)
+    run_training(
+        config,
+        output_path,
+        show_eta=not args.no_eta,
+        show_timing=args.timing,
+        backend_name=args.backend,
+    )
 
 
 if __name__ == "__main__":

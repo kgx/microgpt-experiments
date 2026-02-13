@@ -152,8 +152,19 @@ def state_dict_from_json(data, Value_class=Value):
 
 
 def save_model(path, state_dict, uchars, n_embd, n_head, n_layer, block_size):
-    """Write one JSON file: tokenizer (uchars), config, and all weights."""
+    """Write one JSON file: tokenizer (uchars), config, and all weights.
+    state_dict can be either Value-based (list-of-lists of Value) or already
+    serializable (list-of-lists of numbers) as returned by backend.weights_for_export().
+    """
     vocab_size = len(uchars) + 1
+    if state_dict:
+        sample = next(iter(state_dict.values()))
+        if sample and sample[0] and isinstance(sample[0][0], (int, float)):
+            payload_state = state_dict
+        else:
+            payload_state = state_dict_to_json(state_dict)
+    else:
+        payload_state = {}
     payload = {
         "uchars": list(uchars),
         "n_embd": n_embd,
@@ -161,7 +172,7 @@ def save_model(path, state_dict, uchars, n_embd, n_head, n_layer, block_size):
         "n_layer": n_layer,
         "block_size": block_size,
         "vocab_size": vocab_size,
-        "state_dict": state_dict_to_json(state_dict),
+        "state_dict": payload_state,
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=0)

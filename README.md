@@ -33,6 +33,9 @@ python train.py --scenario names
 # Alice (requires data first: run scripts/download_alice.py)
 python scripts/download_alice.py
 python train.py --scenario alice
+
+# Optional: faster training with NumPy backend (pip install microgpt[numpy] or uv sync --extra numpy)
+python train.py --scenario alice --backend numpy
 ```
 
 **Inference**
@@ -56,6 +59,26 @@ pytest tests/ -v
 ```
 
 (Use `python -m pytest tests/ -v` or `.venv/bin/pytest tests/ -v` if needed.)
+
+**Benchmarking alice (with NumPy + Numba)**
+
+Install the optional backend (numpy, numba, scipy), then run a short benchmark. Use `--backend numpy` for the fast path.
+
+```bash
+# One-time: install optional deps (numpy, numba, scipy)
+uv sync --extra numpy
+
+# Benchmark: a few steps, no model saved (first step may be slow due to JIT)
+python scripts/benchmark_train.py --scenario alice --steps 5 --backend numpy
+```
+
+Compare with the default Python backend:
+
+```bash
+python scripts/benchmark_train.py --scenario alice --steps 2 --backend python
+```
+
+The script prints steps/sec and estimated time for a full 2000-step run. The NumPy+Numba backend is typically several times faster than pure Python.
 
 ## Alice scenario
 
