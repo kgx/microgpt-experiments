@@ -41,6 +41,12 @@ python train.py --scenario alice --backend numpy
 python train.py --scenario alice_v2 --backend numpy --dtype float32
 python train.py --scenario alice_v2 --backend numpy --dtype float32 --grad-accum 4
 python train.py --scenario alice_v2 --backend numpy_batched   # batched-over-positions (often faster)
+
+# PyTorch backend (GPU or CPU): pip install microgpt[pytorch] or uv sync --extra pytorch
+# Install both numpy and pytorch: pip install "microgpt[numpy,pytorch]" or uv sync --extra all
+python train.py --scenario alice --backend pytorch
+python train.py --scenario alice --backend pytorch --device cuda
+python train.py --scenario alice_v2 --backend pytorch --device cuda --grad-accum 4
 ```
 
 **Inference**
@@ -57,6 +63,10 @@ python main.py --model models/names/model.json -i "A"
 # Longer / continuous generation (e.g. for prose models trained with trailing_bos: false)
 python main.py --scenario alice_v2 -i "Alice" --no-stop-at-bos --max-tokens 100
 python main.py --scenario alice_v2 -i "Alice" --chain --max-chars 500 -n 1
+
+# PyTorch inference (faster, can use GPU): pip install microgpt[pytorch]
+python main.py --scenario names --backend pytorch -i "George"
+python main.py --scenario alice --backend pytorch --device cuda -i "Alice"
 ```
 
 Inference options: `--no-stop-at-bos` (do not stop on BOS; use with length-based stopping), `--max-tokens N` (cap new tokens per sample), `--chain` (repeatedly extend by using the last N chars as prompt until `--max-chars`; N defaults to `block_size//2` so each segment can generate many tokens). For more coherent prose, use `--repetition-penalty` (e.g. 1.2), `--repetition-window` (e.g. 32), and `--top-k` (e.g. 40); set `--repetition-penalty 1.0` and `--top-k 0` to disable.
@@ -102,7 +112,7 @@ You should see `JIT verification: numba JIT active (... compiled)`. To print the
 **Further acceleration (numpy backend, before GPU)**
 
 - **`--dtype float32`** — Use single precision. Often ~1.5–2× faster on CPU (less memory bandwidth, better SIMD). Config: `training.dtype: "float32"` in your scenario JSON.
-- **`--grad-accum N`** — Accumulate gradients over N docs per optimizer step. Fewer optimizer steps for the same number of docs; can reduce total time when optimizer is a noticeable fraction of step cost. Only supported with the numpy backend.
+- **`--grad-accum N`** — Accumulate gradients over N docs per optimizer step. Fewer optimizer steps for the same number of docs; can reduce total time when optimizer is a noticeable fraction of step cost. Supported with the numpy and pytorch backends.
 - **`--backend numpy_batched`** — Same as `numpy` but with batched-over-positions forward/backward (one sequence-wide pass). Same math, typically faster; tested for numerical equivalence with `numpy`.
 
 **Using more cores**
@@ -110,9 +120,13 @@ You should see `JIT verification: numba JIT active (... compiled)`. To print the
 - The fused attention kernel uses Numba’s `parallel=True` and `prange` over heads, so it can use multiple CPU cores. No extra config is needed.
 - NumPy’s matrix ops use BLAS when available; thread count is often controlled by `OPENBLAS_NUM_THREADS` or `OMP_NUM_THREADS` (e.g. `export OMP_NUM_THREADS=4`). Setting this too high can slow things down due to overhead.
 
+**PyTorch backend**
+
+Install with `pip install microgpt[pytorch]` or `uv sync --extra pytorch`. Training: `--backend pytorch` (optionally `--device cuda` or `--device mps`). Inference: `main.py --backend pytorch` (optionally `--device cuda`). Same model JSON format; export from PyTorch training is identical to other backends.
+
 **Equivalence**
 
-The numpy backend is tested for numerical equivalence with the python backend (same init, same steps, losses within tolerance). Run: `pytest tests/test_backends.py -v`.
+The numpy and pytorch backends are tested for numerical equivalence with the python backend (same init, same steps, losses within tolerance). Run: `pytest tests/test_backends.py -v`.
 
 ## Alice scenario
 

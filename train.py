@@ -110,14 +110,19 @@ def run_training(
     backend = get_backend(backend_name or train_cfg.get("backend", "python"))
     state = backend.create_state(config, uchars, **(backend_kwargs or {}))
     params = state["params"]
-    num_params = sum(p.size for p in params) if params and hasattr(params[0], "size") else len(params)
+    if params and hasattr(params[0], "numel"):
+        num_params = sum(p.numel() for p in params)
+    elif params and hasattr(params[0], "size") and not callable(getattr(params[0], "size", None)):
+        num_params = sum(p.size for p in params)
+    else:
+        num_params = len(params)
     print(f"num params: {num_params}")
 
     start_time = time.perf_counter()
     min_steps_for_eta = 2
     steps_limit = num_steps if max_steps is None else min(num_steps, max_steps)
     backend_impl = backend_name or train_cfg.get("backend", "python")
-    accum = max(1, grad_accum_steps) if backend_impl in ("numpy", "numpy_batched") else 1
+    accum = max(1, grad_accum_steps) if backend_impl in ("numpy", "numpy_batched", "pytorch") else 1
 
     for step in range(steps_limit):
         step_loss_sum = 0.0
@@ -179,8 +184,9 @@ def main():
     parser.add_argument("--no-eta", action="store_true", help="Do not show ETA in progress")
     parser.add_argument("--timing", action="store_true", help="Show per-step breakdown (forward/backward/optimizer)")
     parser.add_argument("--backend", "-b", help="Training backend (default: python, or config training.backend)")
-    parser.add_argument("--dtype", choices=("float32", "float64"), help="NumPy backend only: float32 for faster CPU (default: float64)")
-    parser.add_argument("--grad-accum", type=int, default=1, metavar="N", help="Accumulate gradients over N docs per optimizer step (numpy / numpy_batched; default 1)")
+    parser.add_argument("--device", help="Device for pytorch backend (e.g. cpu, cuda, mps; default: cuda if available else cpu)")
+    parser.add_argument("--dtype", choices=("float32", "float64"), help="NumPy/PyTorch backend: float32 for faster CPU (default: float64 for numpy, float32 for pytorch)")
+    parser.add_argument("--grad-accum", type=int, default=1, metavar="N", help="Accumulate gradients over N docs per optimizer step (numpy / numpy_batched / pytorch; default 1)")
     args = parser.parse_args()
 
     if args.config:
@@ -203,6 +209,8 @@ def main():
     backend_kwargs = {}
     if args.dtype:
         backend_kwargs["dtype"] = args.dtype
+    if args.device:
+        backend_kwargs["device"] = args.device
     run_training(
         config,
         output_path,

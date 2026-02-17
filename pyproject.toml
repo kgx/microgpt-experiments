@@ -10,6 +10,11 @@ dependencies = [
 
 [project.optional-dependencies]
 numpy = ["numpy>=2.0", "numba>=0.60", "scipy>=1.14"]
+pytorch = ["torch>=2.0"]
+all = [
+    "numpy>=2.0", "numba>=0.60", "scipy>=1.14",
+    "torch>=2.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -49,3 +49,23 @@ def test_inference_smoke():
     assert result.returncode == 0
     assert "inference" in result.stdout
     assert "sample" in result.stdout or "A" in result.stdout
+
+
+def test_inference_pytorch_smoke():
+    """If names model exists and PyTorch is installed, run one sample with --backend pytorch."""
+    if not os.path.isfile(NAMES_MODEL):
+        pytest.skip(f"Model not found: {NAMES_MODEL}. Run: python train.py --scenario names")
+    try:
+        from backends import get_backend
+        get_backend("pytorch")
+    except (KeyError, ImportError):
+        pytest.skip("pytorch backend not available (pip install microgpt[pytorch])")
+    result = subprocess.run(
+        [sys.executable, "main.py", "--scenario", "names", "--backend", "pytorch", "-i", "A", "--samples", "1"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "inference" in result.stdout
+    assert "sample" in result.stdout

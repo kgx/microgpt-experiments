@@ -117,3 +117,65 @@ def test_numpy_batched_matches_sequential(config_and_docs):
         assert numpy.isclose(seq_l, batch_l, rtol=1e-4, atol=1e-3), (
             f"Step {step}: sequential {seq_l:.6f} vs batched {batch_l:.6f}"
         )
+
+
+def test_pytorch_backend_available():
+    """PyTorch backend is registered when torch is installed."""
+    try:
+        get_backend("pytorch")
+    except KeyError:
+        pytest.skip("pytorch backend not available (pip install microgpt[pytorch])")
+
+
+def test_pytorch_backend_equivalence(config_and_docs):
+    """PyTorch backend (if available) matches Python backend loss for same init and steps."""
+    pytest.importorskip("torch")
+    config, docs = config_and_docs
+    uchars = sorted(set("".join(docs)))
+    num_steps = 3
+
+    random.seed(42)
+    py_backend = get_backend("python")
+    py_state = py_backend.create_state(config, uchars)
+    init_weights = state_dict_to_json(py_state["state_dict"])
+
+    py_losses = []
+    for step in range(num_steps):
+        doc = docs[step % len(docs)]
+        loss, _ = py_backend.run_one_step(step, doc, py_state, uchars)
+        py_losses.append(loss)
+
+    try:
+        pt_backend = get_backend("pytorch")
+    except KeyError:
+        pytest.skip("pytorch backend not available (pip install microgpt[pytorch])")
+    pt_state = pt_backend.create_state(
+        config, uchars, init_from=init_weights, device="cpu", dtype="float64"
+    )
+    pt_losses = []
+    for step in range(num_steps):
+        doc = docs[step % len(docs)]
+        loss, _ = pt_backend.run_one_step(step, doc, pt_state, uchars)
+        pt_losses.append(loss)
+
+    for step, (py_l, pt_l) in enumerate(zip(py_losses, pt_losses)):
+        assert abs(py_l - pt_l) < 1e-4 or abs(py_l - pt_l) / (abs(py_l) + 1e-8) < 1e-2, (
+            f"Step {step}: python loss {py_l:.6f} vs pytorch loss {pt_l:.6f}"
+        )
+
+
+def test_pytorch_backend_smoke(config_and_docs):
+    """PyTorch backend run_one_step and weights_for_export run without error."""
+    try:
+        backend = get_backend("pytorch")
+    except KeyError:
+        pytest.skip("pytorch backend not available (pip install microgpt[pytorch])")
+    config, docs = config_and_docs
+    uchars = sorted(set("".join(docs)))
+    state = backend.create_state(config, uchars, device="cpu")
+    doc = docs[0] if docs else "x"
+    loss, timing = backend.run_one_step(0, doc, state, uchars)
+    assert loss >= 0
+    exported = backend.weights_for_export(state)
+    assert "wte" in exported
+    assert isinstance(exported["wte"], list)

@@ -59,8 +59,8 @@ def sample_with_options(
     top_k: int,
     vocab_size: int,
 ) -> int:
-    """Apply temperature, repetition penalty, top-k, then sample one token id. logits are Value objects."""
-    logits_data = [l.data for l in logits]
+    """Apply temperature, repetition penalty, top-k, then sample one token id. logits: list of Value or list of float."""
+    logits_data = [getattr(l, "data", l) for l in logits]
     # Temperature
     if temperature != 1.0:
         logits_data = [x / temperature for x in logits_data]
@@ -94,11 +94,11 @@ def generate_one_run(
     uchars = data["uchars"]
     BOS = data["BOS"]
     vocab_size = data["vocab_size"]
-    state_dict = data["state_dict"]
     n_layer = data["n_layer"]
     n_head = data["n_head"]
     head_dim = data["head_dim"]
     block_size = data["block_size"]
+    use_pytorch = data.get("backend") == "pytorch"
 
     if prompt:
         prompt_ids = [uchars.index(ch) for ch in prompt if ch in uchars]
@@ -107,12 +107,17 @@ def generate_one_run(
         context = [BOS]
 
     n_context = min(len(context), block_size)
-    for pos_id in range(n_context - 1):
-        gpt(context[pos_id], pos_id, keys, values, state_dict, n_layer, n_head, head_dim, block_size)
+    if use_pytorch:
+        from backends.pytorch_backend import gpt_step_pytorch
+        for pos_id in range(n_context - 1):
+            gpt_step_pytorch(context[pos_id], pos_id, keys, values, data)
+    else:
+        state_dict = data["state_dict"]
+        for pos_id in range(n_context - 1):
+            gpt(context[pos_id], pos_id, keys, values, state_dict, n_layer, n_head, head_dim, block_size)
 
     token_id = context[n_context - 1]
     pos_id = n_context - 1
-    # Full sequence of token ids (for repetition penalty over recent context)
     sequence_ids = list(context[:n_context])
     generated = []
     max_gen = block_size - n_context
@@ -122,7 +127,12 @@ def generate_one_run(
     rep_window = getattr(args, "repetition_window", 32)
     top_k = getattr(args, "top_k", 0)
     for _ in range(max_gen):
-        logits = gpt(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_dim, block_size)
+        if use_pytorch:
+            from backends.pytorch_backend import gpt_step_pytorch
+            logits = gpt_step_pytorch(token_id, pos_id, keys, values, data)
+        else:
+            state_dict = data["state_dict"]
+            logits = gpt(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_dim, block_size)
         token_id = sample_with_options(
             logits,
             args.temperature,
@@ -162,6 +172,8 @@ def main():
     parser.add_argument("--chain", action="store_true", help="Chain segments: repeatedly extend by using last N chars as prompt until --max-chars reached")
     parser.add_argument("--max-chars", type=int, default=2000, help="Target total output length when using --chain (default: 2000)")
     parser.add_argument("--chain-context", type=int, default=None, help="Chars to keep as next prompt in --chain (default: block_size//2 so each segment can generate many tokens)")
+    parser.add_argument("--backend", "-b", default="python", choices=("python", "pytorch"), help="Inference backend (default: python; pytorch for GPU)")
+    parser.add_argument("--device", help="Device for pytorch backend (e.g. cpu, cuda, mps; default: cuda if available else cpu)")
     args = parser.parse_args()
 
     if args.chain and args.max_chars <= 0:
@@ -175,7 +187,15 @@ def main():
     if not args.no_seed:
         random.seed(args.seed)
 
-    data = load_model(model_path)
+    if args.backend == "pytorch":
+        try:
+            from backends.pytorch_backend import load_model_pytorch
+            data = load_model_pytorch(model_path, device=args.device)
+        except ImportError:
+            print("Warning: PyTorch not available (pip install microgpt[pytorch]), falling back to python backend.", file=sys.stderr)
+            data = load_model(model_path)
+    else:
+        data = load_model(model_path)
     uchars = data["uchars"]
     BOS = data["BOS"]
     vocab_size = data["vocab_size"]
